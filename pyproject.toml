@@ -1,7 +1,24 @@
 [project]
 name = "nota-tracker"
 version = "1.0.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "playwright==1.42.0",
+  "flask==3.0.2",
+  "flask-cors==4.0.0",
+  "supabase==2.3.4",
+  "gotrue==2.4.2",
+  "postgrest==0.15.0",
+  "realtime==1.0.6",
+  "storage3==0.7.7",
+  "supafunc==0.3.3",
+  "httpx[http2]==0.25.2",
+  "websockets==12.0",
+  "python-dotenv==1.0.1",
+  "gunicorn==21.2.0",
+  "requests==2.31.0",
+  "beautifulsoup4==4.12.3",
+]
 
 [project.scripts]
 app = "backend.server:app"
