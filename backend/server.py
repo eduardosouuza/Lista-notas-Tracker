@@ -11,18 +11,20 @@ load_dotenv()
 app = Flask(__name__, static_folder='../frontend')
 CORS(app)
 
-url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
+url: str | None = os.environ.get("SUPABASE_URL")
+key: str | None = os.environ.get("SUPABASE_KEY")
 
 if not url or not key:
-    print("❌ ERROR: SUPABASE_URL e SUPABASE_KEY não encontrados no .env")
-    exit(1)
+    print("[WARN] SUPABASE_URL e SUPABASE_KEY nao encontrados no ambiente")
 
-supabase: Client = create_client(url, key)
+supabase: Client | None = create_client(url, key) if url and key else None
 
 # ─────────────── AUTENTICAÇÃO ───────────────
 
 def require_auth():
+    if not supabase:
+        return None
+
     auth_header = request.headers.get('Authorization')
     if not auth_header:
         return None

@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: nota-tracker
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium
+    startCommand: gunicorn server:app
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
