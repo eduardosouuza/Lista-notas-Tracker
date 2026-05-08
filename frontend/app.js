@@ -121,6 +121,16 @@ async function fetchAPI(endpoint, options = {}) {
   return res;
 }
 
+async function parseAPIResponse(res) {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return { erro: text.slice(0, 300) };
+  }
+}
+
 function showPage(name) {
   if (!sessionToken && name !== 'login' && name !== 'register') {
     showAuthPage('login');
@@ -355,7 +365,7 @@ async function buscarNota() {
   }, 4000);
   try {
     const res = await fetchAPI('/buscar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chave }) });
-    const data = await res.json();
+    const data = await parseAPIResponse(res);
     if (res.status === 409) { setStatus(`⚠️ Nota já cadastrada.`, 'error'); return; }
     if (!res.ok) { setStatus(`❌ ${data.erro || 'Erro desconhecido'}`, 'error'); return; }
     setStatus(`✅ Nota adicionada! ${data.emitente || ''}`, 'success');

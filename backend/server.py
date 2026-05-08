@@ -34,15 +34,23 @@ def require_auth():
     token = auth_header.replace('Bearer ', '')
     try:
         user_res = supabase.auth.get_user(token)
+        request_client = create_client(url, key)
+        request_client.postgrest.auth(token)
+        g.supabase = request_client
         return user_res.user
     except Exception as e:
         return None
+
+
+def db_client():
+    return getattr(g, 'supabase', supabase)
 
 # ─────────────── HELPERS DE BANCO ───────────────
 
 def salvar_nota_supabase(nota: dict, user_id: str):
     # Verifica se já existe
-    existente = supabase.table('notas').select('id').eq('chave', nota['chave']).eq('user_id', user_id).execute()
+    db = db_client()
+    existente = db.table('notas').select('id').eq('chave', nota['chave']).eq('user_id', user_id).execute()
     if existente.data:
         return existente.data[0]['id']
 
@@ -60,7 +68,7 @@ def salvar_nota_supabase(nota: dict, user_id: str):
         'dados_json': json.dumps(nota, ensure_ascii=False)
     }
 
-    res_nota = supabase.table('notas').insert(nova_nota).execute()
+    res_nota = db.table('notas').insert(nova_nota).execute()
     nota_id = res_nota.data[0]['id']
 
     # Insere produtos
@@ -75,7 +83,7 @@ def salvar_nota_supabase(nota: dict, user_id: str):
         })
     
     if produtos:
-        supabase.table('produtos').insert(produtos).execute()
+        db.table('produtos').insert(produtos).execute()
 
     return nota_id
 
@@ -87,7 +95,7 @@ def listar_notas():
     if not user: return jsonify({'erro': 'Não autorizado'}), 401
 
     # Fetch notes
-    res = supabase.table('notas').select('*, produtos(id)').eq('user_id', user.id).order('criado_em', desc=True).execute()
+    res = db_client().table('notas').select('*, produtos(id)').eq('user_id', user.id).order('criado_em', desc=True).execute()
     
     notas = []
     for n in res.data:
@@ -103,7 +111,7 @@ def detalhe_nota(nota_id):
     user = require_auth()
     if not user: return jsonify({'erro': 'Não autorizado'}), 401
 
-    res = supabase.table('notas').select('*, produtos(*)').eq('id', nota_id).eq('user_id', user.id).execute()
+    res = db_client().table('notas').select('*, produtos(*)').eq('id', nota_id).eq('user_id', user.id).execute()
     if not res.data:
         return jsonify({'erro': 'Nota não encontrada'}), 404
         
@@ -116,7 +124,7 @@ def deletar_nota(nota_id):
     user = require_auth()
     if not user: return jsonify({'erro': 'Não autorizado'}), 401
 
-    supabase.table('notas').delete().eq('id', nota_id).eq('user_id', user.id).execute()
+    db_client().table('notas').delete().eq('id', nota_id).eq('user_id', user.id).execute()
     return jsonify({'ok': True})
 
 @app.route('/api/buscar', methods=['POST'])
@@ -134,7 +142,7 @@ def buscar_nota():
     except ValueError as e:
         return jsonify({'erro': str(e)}), 400
 
-    existente = supabase.table('notas').select('id').eq('chave', chave).eq('user_id', user.id).execute()
+    existente = db_client().table('notas').select('id').eq('chave', chave).eq('user_id', user.id).execute()
     if existente.data:
         return jsonify({'erro': 'Nota já cadastrada', 'nota_id': existente.data[0]['id']}), 409
 
@@ -144,7 +152,10 @@ def buscar_nota():
     except Exception as e:
         return jsonify({'erro': f'Falha ao buscar nota na SEFAZ: {e}'}), 500
 
-    nota_id = salvar_nota_supabase(nota, user.id)
+    try:
+        nota_id = salvar_nota_supabase(nota, user.id)
+    except Exception as e:
+        return jsonify({'erro': f'Falha ao salvar nota no Supabase: {e}'}), 500
     nota['id'] = nota_id
     return jsonify(nota), 201
 
@@ -153,7 +164,7 @@ def dashboard():
     user = require_auth()
     if not user: return jsonify({'erro': 'Não autorizado'}), 401
 
-    res = supabase.table('notas').select('*, produtos(*)').eq('user_id', user.id).execute()
+    res = db_client().table('notas').select('*, produtos(*)').eq('user_id', user.id).execute()
     notas = res.data
     
     total_gasto = sum(n.get('valor_total') or 0 for n in notas)
