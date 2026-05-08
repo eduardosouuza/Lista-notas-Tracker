@@ -1,7 +1,16 @@
-from playwright.sync_api import sync_playwright
 import re
 
+import requests
+from bs4 import BeautifulSoup
+
 SEFAZ_URL = "https://www.sefaz.rs.gov.br/NFE/NFE-NFC.aspx"
+SEFAZ_IFRAME_URL = "https://www.sefaz.rs.gov.br/ASP/AAE_ROOT/NFE/SAT-WEB-NFE-NFC_1.asp"
+SEFAZ_POST_URL = "https://www.sefaz.rs.gov.br/ASP/AAE_ROOT/NFE/SAT-WEB-NFE-NFC_2.asp"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def limpar_chave(entrada: str) -> str:
@@ -16,110 +25,70 @@ def limpar_chave(entrada: str) -> str:
 
 
 def scrape_nota(chave: str) -> dict:
-    """
-    Faz scraping da NFC-e na SEFAZ-RS.
-
-    Fluxo da pagina:
-      1. A URL principal carrega um iframe (frames[1]) com o formulario.
-      2. O iframe ja vem com chaveNFe preenchida via querystring.
-      3. Clicamos no botao submit 'Avançar' dentro do iframe.
-      4. Apos o submit, o iframe exibe o DANFE NFC-e renderizado via XSLT.
-      5. Extraimos dados via innerText (com tabs entre celulas de tabela).
-    """
+    """Busca a NFC-e na SEFAZ-RS sem depender de navegador/Chromium."""
     chave = limpar_chave(chave)
     url = f"{SEFAZ_URL}?chaveNFe={chave}"
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
+    try:
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": USER_AGENT})
+            session.get(SEFAZ_IFRAME_URL, params={"chaveNFe": chave}, timeout=20)
+            response = session.post(
+                SEFAZ_POST_URL,
+                data={"HML": "false", "chaveNFe": chave, "Action": "Avancar"},
+                headers={"Referer": url},
+                timeout=30,
+            )
+            response.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Erro ao buscar nota na SEFAZ: {e}") from e
 
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2500)
-        except Exception as e:
-            browser.close()
-            raise RuntimeError(f"Erro ao carregar a pagina da SEFAZ: {e}")
+    response.encoding = response.apparent_encoding or "iso-8859-1"
+    html = response.text
+    soup = BeautifulSoup(html, "html.parser")
+    texto = soup.get_text("\n", strip=True)
 
-        # A pagina principal e frames[0]; o iframe do formulario e frames[1]
-        if len(page.frames) < 2:
-            browser.close()
-            raise RuntimeError("Iframe da SEFAZ nao encontrado (frames < 2)")
-
-        iframe = page.frames[1]
-
-        btn = iframe.query_selector('input[type=submit]')
-        if not btn:
-            browser.close()
-            raise RuntimeError("Botao 'Avançar' nao encontrado no iframe")
-
-        btn.click()
-        page.wait_for_timeout(4000)
-
-        # Texto puro (o innerText preserva \t entre celulas de tabela)
-        texto = iframe.inner_text('body')
-
-        # Extrai produtos a partir do innerText tab-separado
-        # Cabecalho: "Codigo\tDescricao\tQtde\tUn\tVl Unit\tVl Total"
-        # Produto:   "1\tBUFFET LIVRE\t1\tUN\t39,5\t39,50"
-        produtos_js = iframe.evaluate("""() => {
-            const texto = document.body ? document.body.innerText : '';
-            const linhas = texto.split('\\n').map(l => l.trim()).filter(l => l);
-
-            let produtos = [];
-            let dentroTabela = false;
-
-            for (const linha of linhas) {
-                const partes = linha.split('\\t').map(p => p.trim());
-                const txt = partes.join('|').toLowerCase();
-
-                // Detecta linha de cabecalho da tabela de produtos
-                if (txt.includes('descri') && (txt.includes('qtd') || txt.includes('vl unit'))) {
-                    dentroTabela = true;
-                    continue;
-                }
-
-                // Para ao encontrar a secao de totais
-                if (dentroTabela && /valor total|forma pag|desconto/i.test(linha)) {
-                    break;
-                }
-
-                // Linha de produto valida: pelo menos 4 colunas tab-separadas
-                if (dentroTabela && partes.length >= 4) {
-                    // Estrutura: [codigo, nome, qtd, un, vUnit, vTotal]
-                    const nome = partes[1] || partes[0];
-                    if (nome && nome.length > 1 && !/valor|forma|desconto|pagamento/i.test(nome)) {
-                        produtos.push({
-                            nome:   nome,
-                            qtd:    partes[2] || '',
-                            un:     partes[3] || '',
-                            vUnit:  partes[4] || '',
-                            vTotal: partes[5] || partes[4] || '',
-                        });
-                    }
-                }
-            }
-            return produtos;
-        }""")
-
-        browser.close()
+    if re.search(r'erro|inv[aá]lida|n[aã]o encontrada', texto, re.IGNORECASE):
+        raise RuntimeError("A SEFAZ nao retornou uma NFC-e valida para esta chave")
 
     return {
         "chave": chave,
         "url": url,
         "texto": texto,
-        "produtos_js": produtos_js,
+        "html": html,
+        "produtos_js": _extrair_produtos_html(soup),
     }
 
 
-# ─── Helpers ───────────────────────────────────────────────────────────────
+def _extrair_produtos_html(soup: BeautifulSoup) -> list[dict]:
+    for table in soup.find_all("table"):
+        cells = [cell.get_text(" ", strip=True) for cell in table.find_all(["th", "td"])]
+        normalized = [re.sub(r"\s+", " ", cell).strip() for cell in cells if cell.strip()]
+        lowered = [cell.lower() for cell in normalized]
+
+        headers = ["código", "descrição", "qtde", "un", "vl unit", "vl total"]
+        if lowered[:6] != headers:
+            continue
+
+        produtos = []
+        for i in range(6, len(normalized), 6):
+            row = normalized[i:i + 6]
+            if len(row) < 6:
+                continue
+            codigo, nome, qtd, un, v_unit, v_total = row
+            if not codigo or not nome:
+                continue
+            produtos.append({
+                "nome": nome,
+                "qtd": qtd,
+                "un": un,
+                "vUnit": v_unit,
+                "vTotal": v_total,
+            })
+        return produtos
+
+    return []
+
 
 def _re(padrao, texto, grupo=1, flags=re.IGNORECASE | re.MULTILINE):
     m = re.search(padrao, texto, flags)
@@ -127,22 +96,7 @@ def _re(padrao, texto, grupo=1, flags=re.IGNORECASE | re.MULTILINE):
 
 
 def parse_nota_do_html(dados_raw: dict) -> dict:
-    """
-    Extrai estrutura limpa a partir do texto puro do DANFE NFC-e.
-
-    Exemplo do texto retornado pelo iframe apos o submit:
-
-        CONSULTA DA NFC-e
-        CONSTANTINO BALDASSO
-        CNPJ: 04.167.842/0001-93 Inscricao Estadual: 0962847143
-        RUA DOS ANDRADAS, 1358, CENTRO, PORTO ALEGRE, RS
-        DANFE NFC-e - ...
-        NFC-e no: 68695 Serie: 1 Data de Emissao: 20/12/2024 11:34:07
-        ...
-        Codigo  Descricao  Qtde  Un  Vl Unit  Vl Total
-        1       BUFFET LIVRE  1  UN  39,5  39,50
-        Valor total R$  39,50
-    """
+    """Extrai estrutura limpa a partir do texto/HTML retornado pela SEFAZ."""
     texto = dados_raw.get("texto", "")
     linhas = [l.strip() for l in texto.splitlines() if l.strip()]
 
@@ -151,73 +105,56 @@ def parse_nota_do_html(dados_raw: dict) -> dict:
             return 0.0
         v = re.sub(r'[^\d,.]', '', str(v))
         if ',' in v and '.' in v:
-            # Formato BR: 1.234,56 -> 1234.56
             v = v.replace('.', '').replace(',', '.')
         elif ',' in v:
-            # Formato: 39,50 -> 39.50
             v = v.replace(',', '.')
         try:
             return float(v)
         except Exception:
             return 0.0
 
-    # ── Emitente ─────────────────────────────────────────────────────────
-    # Aparece como a primeira linha significativa apos "CONSULTA DA NFC-e"
     emitente = None
     for i, linha in enumerate(linhas):
         if re.search(r'CONSULTA DA NFC', linha, re.IGNORECASE):
-            for j in range(i + 1, min(i + 6, len(linhas))):
-                candidato = linhas[j]
-                if (candidato and len(candidato) > 2
-                        and not re.search(
-                            r'NFC|DANFE|NFe|Consulta|Voltar|Imprimir|Enviar',
-                            candidato, re.IGNORECASE
-                        )):
+            for candidato in linhas[i + 1:i + 6]:
+                if candidato and not re.search(
+                    r'NFC|DANFE|NFe|Consulta|Voltar|Imprimir|Enviar',
+                    candidato,
+                    re.IGNORECASE,
+                ):
                     emitente = candidato
                     break
             break
 
-    # Fallback: linha imediatamente antes do CNPJ
     if not emitente:
         for i, linha in enumerate(linhas):
             if 'CNPJ' in linha.upper() and i > 0:
-                candidato = linhas[i - 1]
-                if candidato and len(candidato) > 2 and not re.search(
-                    r'NFC|DANFE|Consulta|Voltar|Imprimir', candidato, re.IGNORECASE
-                ):
-                    emitente = candidato
+                emitente = linhas[i - 1]
                 break
 
-    # ── CNPJ ─────────────────────────────────────────────────────────────
-    cnpj = _re(r'CNPJ[:\s]+([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}\/?[0-9]{4}-?[0-9]{2})', texto)
+    cnpj = _re(r'CNPJ[:\s\n]+([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}\/?[0-9]{4}-?[0-9]{2})', texto)
 
-    # ── Endereço ─────────────────────────────────────────────────────────
     endereco = None
-    m_cnpj_pos = re.search(r'CNPJ[^\n]+', texto, re.IGNORECASE)
-    if m_cnpj_pos:
-        resto = texto[m_cnpj_pos.end():].lstrip()
-        primeira = resto.splitlines()[0].strip() if resto else None
-        if primeira and len(primeira) > 5:
-            endereco = primeira
+    for i, linha in enumerate(linhas):
+        if cnpj and cnpj in linha:
+            for candidato in linhas[i + 1:i + 6]:
+                if candidato and not re.search(r'DANFE|NFC|Emiss', candidato, re.IGNORECASE):
+                    endereco = candidato
+                    break
+            break
 
-    # ── Data de emissão ───────────────────────────────────────────────────
-    data_emissao = _re(r'Data de Emiss[aã]o[:\s]+([0-9]{2}/[0-9]{2}/[0-9]{4})', texto)
+    data_emissao = _re(r'Data de Emiss[aã]o[:\s\n]+([0-9]{2}/[0-9]{2}/[0-9]{4})', texto)
 
-    # ── Número da nota ────────────────────────────────────────────────────
-    numero = _re(r'NFC-e\s+n[º°o\.]+[:\s]*([0-9]+)', texto)
+    numero = _re(r'NFC-e\s+n[º°o\.]+[:\s\n]*([0-9]+)', texto)
     if not numero:
-        numero = _re(r'NFC-e\s+n\s*[:\s]*([0-9]+)', texto)
+        numero = _re(r'NFC-e\s+n\s*[:\s\n]*([0-9]+)', texto)
 
-    # ── Valor total ───────────────────────────────────────────────────────
-    total_str = _re(r'Valor total\s+R\$\s*([\d\.,]+)', texto)
+    total_str = _re(r'Valor total\s+R\$\s*\n?\s*([\d\.,]+)', texto)
     if not total_str:
-        total_str = _re(r'VALOR PAGO\s*R\$\s*([\d\.,]+)', texto)
+        total_str = _re(r'VALOR PAGO\s*R\$\s*\n?\s*[\w\s]*\n?\s*([\d\.,]+)', texto)
     valor_total = parse_valor(total_str)
 
-    # ── Produtos ──────────────────────────────────────────────────────────
     produtos = []
-
-    # 1) Via extração JS do innerText tab-separado (principal)
     for p in dados_raw.get("produtos_js", []):
         nome = (p.get("nome") or "").strip()
         if nome and len(nome) > 1:
@@ -228,30 +165,19 @@ def parse_nota_do_html(dados_raw: dict) -> dict:
                 "valor_total": parse_valor(p.get("vTotal")),
             })
 
-    # 2) Fallback: extrai via regex no texto puro com tabs
     if not produtos:
-        in_produtos = False
-        for linha in texto.splitlines():
-            linha = linha.strip()
-            if not linha:
-                continue
-            partes = [p.strip() for p in linha.split('\t')]
-
-            txt = '|'.join(partes).lower()
-            if 'descri' in txt and ('qtd' in txt or 'vl unit' in txt):
-                in_produtos = True
-                continue
-            if in_produtos and re.search(r'valor total|forma pag|desconto', linha, re.IGNORECASE):
-                break
-            if in_produtos and len(partes) >= 4:
-                nome = partes[1] if len(partes) > 1 else partes[0]
-                if nome and not re.search(r'Valor|Forma|Desconto|Pago', nome, re.IGNORECASE):
+        for i, linha in enumerate(linhas):
+            if linha.lower() == "código" and linhas[i + 1:i + 6] == ["Descrição", "Qtde", "Un", "Vl Unit", "Vl Total"]:
+                j = i + 6
+                while j + 5 < len(linhas) and not re.search(r'valor total|forma pag|desconto', linhas[j], re.IGNORECASE):
                     produtos.append({
-                        "nome": nome,
-                        "qtd": parse_valor(partes[2] if len(partes) > 2 else ''),
-                        "valor_unitario": parse_valor(partes[4] if len(partes) > 4 else ''),
-                        "valor_total": parse_valor(partes[5] if len(partes) > 5 else ''),
+                        "nome": linhas[j + 1],
+                        "qtd": parse_valor(linhas[j + 2]),
+                        "valor_unitario": parse_valor(linhas[j + 4]),
+                        "valor_total": parse_valor(linhas[j + 5]),
                     })
+                    j += 6
+                break
 
     return {
         "chave": dados_raw.get("chave"),
