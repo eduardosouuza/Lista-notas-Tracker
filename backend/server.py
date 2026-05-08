@@ -2,7 +2,10 @@ import sys, os, json
 from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
 from datetime import datetime
-from scraper import scrape_nota, parse_nota_do_html, limpar_chave
+try:
+    from .scraper import scrape_nota, parse_nota_do_html, limpar_chave
+except ImportError:
+    from scraper import scrape_nota, parse_nota_do_html, limpar_chave
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
